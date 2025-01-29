@@ -1,19 +1,4 @@
-provider "aws" {
-  region = "us-east-1"
-}
-
-terraform {
-  required_providers {
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.0"
-    }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.0"
-    }
-  }
-}
+# VPC Module
 
 module "vpc" {
   source   = "./vpc_module"
@@ -41,17 +26,7 @@ module "vpc" {
   }
 }
 
-# module "alb" {
-#   source            = "./alb_module"
-#   vpc_id            = module.vpc.vpc_id
-#   public_subnets    = [module.vpc.public_subnet_ids["us-east-1a"], module.vpc.public_subnet_ids["us-east-1b"]]
-#   security_group_id = module.vpc.security_group_id
-# }
-
-# module "eks" {
-#   source     = "./eks_module"
-#   subnet_ids = module.vpc.private_subnet_ids  # Assuming private subnets for EKS nodes
-# }
+# EKS Module
 
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
@@ -73,9 +48,10 @@ module "eks" {
 
   eks_managed_node_groups = {
     stw_node_wg = {
-      min_size     = 2
-      max_size     = 6
-      desired_size = 2
+      iam_role_name = "stw-node-group-role"
+      min_size      = 1
+      max_size      = 6
+      desired_size  = 1
     }
   }
 
@@ -86,20 +62,50 @@ module "eks" {
     vpc-cni = {
       most_recent              = true
       before_compute           = true
-      service_account_role_arn = module.vpc_cni_irsa.iam_role_arn    
+      service_account_role_arn = module.vpc_cni_irsa.iam_role_arn
     }
   }
 }
 
 output "eks_cluster_endpoint" {
-  value = data.aws_eks_cluster.cluster.endpoint
+  value     = data.aws_eks_cluster.cluster.endpoint
   sensitive = true
 }
 
 output "eks_auth_token" {
-  value = data.aws_eks_cluster_auth.cluster.token
+  value     = data.aws_eks_cluster_auth.cluster.token
   sensitive = true
 }
+
+data "aws_eks_cluster" "cluster" {
+  name       = module.eks.cluster_name
+  depends_on = [module.eks]
+}
+
+data "aws_eks_cluster_auth" "cluster" {
+  name       = module.eks.cluster_name
+  depends_on = [module.eks]
+}
+
+resource "aws_iam_policy" "eks_cluster_additional_policy" {
+  name        = "${module.eks.cluster_name}-alb-eks-policy"
+  path        = "/"
+  description = "Additional IAM policy for EKS cluster"
+  policy      = file("iam_policy.json")
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy_attachment" {
+  role       = module.eks.cluster_iam_role_name # Ensure this references the IAM role created for the EKS cluster
+  policy_arn = aws_iam_policy.eks_cluster_additional_policy.arn
+}
+
+resource "aws_iam_role_policy_attachment" "node_group_policy_attachment" {
+  role       = module.eks.eks_managed_node_groups["stw_node_wg"].iam_role_name
+  policy_arn = aws_iam_policy.eks_cluster_additional_policy.arn
+}
+
+
+# VPC CNI Module
 
 module "vpc_cni_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
@@ -117,19 +123,40 @@ module "vpc_cni_irsa" {
   }
 }
 
-# module "argocd" {
-#   source  = "./argocd_module"
-#   providers = {
-#     kubernetes = kubernetes
-#     helm       = helm
-#   }
 
-#   depends_on = [
-#     module.vpc,
-#     module.alb,
-#     module.eks
-#   ]
-# }
+# ALB Controller
+
+resource "null_resource" "helm_repo_add" {
+  provisioner "local-exec" {
+    command = "helm repo add eks https://aws.github.io/eks-charts && helm repo update"
+  }
+
+  triggers = {
+    always_run = "${timestamp()}"
+  }
+}
+
+resource "helm_release" "aws_load_balancer_controller" {
+  provider = helm
+
+  name       = "aws-load-balancer-controller"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+  namespace  = "kube-system"
+  version    = "1.11.0"
+  timeout    = 600 # Increase timeout to 600 seconds (10 minutes)
+
+  set {
+    name  = "clusterName"
+    value = module.eks.cluster_name
+  }
+
+  depends_on = [
+    module.eks,                   # Ensures the EKS cluster is created
+    data.aws_eks_cluster.cluster, # Ensures cluster data is retrieved
+    data.aws_eks_cluster_auth.cluster
+  ]
+}
 
 
 resource "aws_iam_policy" "aws_load_balancer_controller" {
@@ -160,47 +187,4 @@ resource "aws_iam_role" "aws_load_balancer_controller_role" {
 resource "aws_iam_role_policy_attachment" "aws_load_balancer_controller_attach" {
   role       = aws_iam_role.aws_load_balancer_controller_role.name
   policy_arn = aws_iam_policy.aws_load_balancer_controller.arn
-}
-
-data "aws_eks_cluster" "cluster" {
-  name      = "econstruction-cluster"
-}
-
-data "aws_eks_cluster_auth" "cluster" {
-  name      = "econstruction-cluster"
-}
-
-provider "helm" {
-  kubernetes {
-    host                   = data.aws_eks_cluster.cluster.endpoint
-    cluster_ca_certificate = base64decode(data.aws_eks_cluster.cluster.certificate_authority[0].data)
-    token                  = data.aws_eks_cluster_auth.cluster.token
-  }
-}
-
-
-resource "helm_release" "aws_load_balancer_controller" {
-  provider = helm
-
-  name       = "aws-load-balancer-controller"
-  repository = "https://aws.github.io/eks-charts"
-  chart      = "aws-load-balancer-controller"
-  namespace  = "kube-system"
-  version    = "1.11.0"
-  timeout    = 600  # Increase timeout to 600 seconds (10 minutes)
-
-  set {
-    name  = "clusterName"
-    value = module.eks.cluster_name
-  }
-
-  # set {
-  #   name  = "serviceAccount.create"
-  #   value = "false"
-  # }
-
-  # set {
-  #   name  = "serviceAccount.name"
-  #   value = "aws-load-balancer-controller"
-  # }
 }
